@@ -34,7 +34,7 @@ type Node struct {
 	votedFor    string
 	leaderID    string
 
-	logs        []LogEntry  // logs[0] 为哨兵（快照边界占位）
+	logs        []LogEntry // logs[0] 为哨兵（快照边界占位）
 	commitIndex uint64
 	lastApplied uint64
 

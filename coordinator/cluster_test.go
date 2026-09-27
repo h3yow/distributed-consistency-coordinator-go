@@ -38,11 +38,11 @@ func newTestClusterSnap(t *testing.T, snapThreshold uint64, ids ...string) *test
 	t.Helper()
 	tr := NewLocalTransport()
 	c := &testCluster{
-		t:        t,
-		tr:       tr,
-		nodes:    map[string]*Node{},
-		fsms:     map[string]*KVFSM{},
-		dirs:     map[string]string{},
+		t:             t,
+		tr:            tr,
+		nodes:         map[string]*Node{},
+		fsms:          map[string]*KVFSM{},
+		dirs:          map[string]string{},
 		peerList:      ids,
 		snapThreshold: snapThreshold,
 	}
@@ -91,7 +91,7 @@ func (c *testCluster) startAll() {
 }
 
 func (c *testCluster) stop(id string) { c.nodes[id].Stop() }
-func (c *testCluster) stopAll()       {
+func (c *testCluster) stopAll() {
 	for _, id := range c.peerList {
 		c.stop(id)
 	}
