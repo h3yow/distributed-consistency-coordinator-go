@@ -22,6 +22,8 @@ type Node struct {
 	fsm       FSM
 
 	// 事件循环
+	// events 必须是无缓冲的：停止后向它发送会立即让位于 done 分支，
+	// 避免把消息排进已死循环的缓冲区而永久阻塞调用方。
 	events chan func()
 	stopCh chan struct{}
 	done   chan struct{}
@@ -85,7 +87,7 @@ func NewNode(cfg Config, transport Transport, fsm FSM, storage Storage) (*Node, 
 		store:       storage,
 		transport:   transport,
 		fsm:         fsm,
-		events:      make(chan func(), 256),
+		events:      make(chan func()),
 		stopCh:      make(chan struct{}),
 		done:        make(chan struct{}),
 		role:        RoleFollower,
