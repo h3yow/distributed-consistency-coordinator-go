@@ -149,3 +149,14 @@ func (f *KVFSM) Len() int {
 	defer f.mu.Unlock()
 	return len(f.data)
 }
+
+// Items 返回全部键值对的副本（测试与诊断辅助）。
+func (f *KVFSM) Items() map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string]string, len(f.data))
+	for k, v := range f.data {
+		out[k] = v
+	}
+	return out
+}

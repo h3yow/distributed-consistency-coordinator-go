@@ -13,12 +13,13 @@ import (
 
 // testCluster 封装本地多节点测试环境。
 type testCluster struct {
-	t        *testing.T
-	tr       *LocalTransport
-	nodes    map[string]*Node
-	fsms     map[string]*KVFSM
-	dirs     map[string]string
-	peerList []string
+	t             *testing.T
+	tr            *LocalTransport
+	nodes         map[string]*Node
+	fsms          map[string]*KVFSM
+	dirs          map[string]string
+	peerList      []string
+	snapThreshold uint64
 }
 
 func testLogger(t *testing.T) *slog.Logger {
@@ -28,6 +29,12 @@ func testLogger(t *testing.T) *slog.Logger {
 
 func newTestCluster(t *testing.T, ids ...string) *testCluster {
 	t.Helper()
+	return newTestClusterSnap(t, 0, ids...)
+}
+
+// newTestClusterSnap 创建带快照阈值的测试集群。
+func newTestClusterSnap(t *testing.T, snapThreshold uint64, ids ...string) *testCluster {
+	t.Helper()
 	tr := NewLocalTransport()
 	c := &testCluster{
 		t:        t,
@@ -35,7 +42,8 @@ func newTestCluster(t *testing.T, ids ...string) *testCluster {
 		nodes:    map[string]*Node{},
 		fsms:     map[string]*KVFSM{},
 		dirs:     map[string]string{},
-		peerList: ids,
+		peerList:      ids,
+		snapThreshold: snapThreshold,
 	}
 	for _, id := range ids {
 		c.addNode(t, id)
@@ -58,6 +66,7 @@ func (c *testCluster) addNode(t *testing.T, id string) {
 		ElectionTimeoutMin: 60 * time.Millisecond,
 		ElectionTimeoutMax: 120 * time.Millisecond,
 		ProposeTimeout:     2 * time.Second,
+		SnapshotThreshold:  c.snapThreshold,
 		Logger:             testLogger(t),
 	}
 	n, err := NewNode(cfg, c.tr, fsm, nil)
@@ -107,6 +116,7 @@ func (c *testCluster) restartNode(t *testing.T, id string) *Node {
 		ElectionTimeoutMin: 60 * time.Millisecond,
 		ElectionTimeoutMax: 120 * time.Millisecond,
 		ProposeTimeout:     2 * time.Second,
+		SnapshotThreshold:  c.snapThreshold,
 		Logger:             testLogger(t),
 	}
 	n, err := NewNode(cfg, c.tr, fsm, nil)

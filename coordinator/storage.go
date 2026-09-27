@@ -28,6 +28,8 @@ type Storage interface {
 	AppendLog(entries []LogEntry) error
 	// TruncateLog 删除下标大于 from 的所有条目（用于覆盖冲突日志）。
 	TruncateLog(from uint64) error
+	// DiscardPrefix 删除下标不大于 through 的条目（快照压缩时丢弃已进快照的头部）。
+	DiscardPrefix(through uint64) error
 	// LoadLog 读取全部日志条目。
 	LoadLog() ([]LogEntry, error)
 
@@ -184,6 +186,19 @@ func (s *fileStorage) TruncateLog(from uint64) error {
 		}
 	}
 	s.log = keep
+	return s.persistLogLocked()
+}
+
+func (s *fileStorage) DiscardPrefix(through uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kept := s.log[:0]
+	for _, e := range s.log {
+		if e.Index > through {
+			kept = append(kept, e)
+		}
+	}
+	s.log = kept
 	return s.persistLogLocked()
 }
 

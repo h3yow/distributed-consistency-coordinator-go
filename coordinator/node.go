@@ -53,6 +53,7 @@ type Node struct {
 	// 快照边界（logs[0] 的 Term/Index）
 	snapIndex uint64
 	snapTerm  uint64
+	snapData  []byte // 缓存最近一次快照数据，供 InstallSnapshot 转发
 }
 
 type proposeResult struct {
@@ -122,6 +123,7 @@ func (n *Node) Start() error {
 	if hasSnap {
 		n.snapIndex = meta.LastIncludedIndex
 		n.snapTerm = meta.LastIncludedTerm
+		n.snapData = append([]byte(nil), data...)
 		n.logs[0] = LogEntry{Index: n.snapIndex, Term: n.snapTerm}
 		if err := n.fsm.Restore(data); err != nil {
 			return err
@@ -177,6 +179,15 @@ func (n *Node) Stop() {
 	n.transport.Unregister(n.id)
 }
 
+// ctxErr 把 context 截止/取消映射为模块可区分的错误：
+// 截止统一为 ErrTimeout，取消保留原错误。
+func ctxErr(ctx context.Context) error {
+	if ctx.Err() == context.DeadlineExceeded {
+		return ErrTimeout
+	}
+	return ctx.Err()
+}
+
 // Propose 提交一条命令，阻塞直到被提交并应用、或失败。
 // 失败原因可通过 errors.Is 区分：ErrNotLeader / ErrLeadershipLost / ErrTimeout / ErrStopped。
 func (n *Node) Propose(ctx context.Context, command []byte) (any, error) {
@@ -187,7 +198,7 @@ func (n *Node) Propose(ctx context.Context, command []byte) (any, error) {
 	case <-n.done:
 		return nil, ErrStopped
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, ctxErr(ctx)
 	}
 	timeout := time.NewTimer(n.cfg.ProposeTimeout)
 	defer timeout.Stop()
@@ -199,7 +210,7 @@ func (n *Node) Propose(ctx context.Context, command []byte) (any, error) {
 	case <-timeout.C:
 		return nil, ErrTimeout
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, ctxErr(ctx)
 	}
 }
 
@@ -221,6 +232,23 @@ func (n *Node) Status() NodeStatus {
 	}:
 	case <-n.done:
 		return NodeStatus{ID: n.id, Role: RoleFollower}
+	}
+	return <-resCh
+}
+
+// CommittedEntries 返回已提交日志条目前缀（诊断与测试用途）。
+func (n *Node) CommittedEntries() []LogEntry {
+	resCh := make(chan []LogEntry, 1)
+	select {
+	case n.events <- func() {
+		var out []LogEntry
+		for idx := n.snapIndex + 1; idx <= n.commitIndex; idx++ {
+			out = append(out, n.entryAt(idx))
+		}
+		resCh <- out
+	}:
+	case <-n.done:
+		return nil
 	}
 	return <-resCh
 }
