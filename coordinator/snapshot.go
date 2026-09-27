@@ -8,8 +8,8 @@ func (n *Node) maybeSnapshot() {
 	// TODO
 }
 
-// takeSnapshot 基于 lastApplied 生成快照并压缩日志。
-func (n *Node) takeSnapshot() {
+// sendSnapshot 向落后到已快照范围的 follower 发送 InstallSnapshot。
+func (n *Node) sendSnapshot(to string) {
 	// TODO
 }
 

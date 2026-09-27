@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"log/slog"
+	"math/rand/v2"
 	"time"
 )
 
@@ -38,6 +39,9 @@ type Node struct {
 	// leader 复制状态
 	nextIndex  map[string]uint64
 	matchIndex map[string]uint64
+
+	// 选举计票（候选人任期内有效）
+	votesReceived int
 
 	// 选举计时
 	lastHeartbeat time.Time // 最近一次收到有效 leader 心跳/授予投票的时间
@@ -97,8 +101,65 @@ func NewNode(cfg Config, transport Transport, fsm FSM, storage Storage) (*Node, 
 func (n *Node) ID() string { return n.id }
 
 // Start 启动节点：恢复持久化状态并开启事件循环。
+//
+// 恢复顺序（重启一致性）：
+//  1. 恢复任期/投票（防止重启后重复投票导致双主）；
+//  2. 恢复快照：FSM 回放到快照边界；
+//  3. 加载快照之后的日志；
+//  4. 按已应用下标重放日志到 FSM（FSM.Apply 必须幂等）；
+//  5. 已应用的条目必然已提交，提交位点至少恢复到 applied。
 func (n *Node) Start() error {
-	// TODO: 从 storage 恢复 stable/log/snapshot/applied，然后启动事件循环
+	stable, err := n.store.LoadStable()
+	if err != nil {
+		return err
+	}
+	n.currentTerm, n.votedFor = stable.CurrentTerm, stable.VotedFor
+
+	meta, data, hasSnap, err := n.store.LoadSnapshot()
+	if err != nil {
+		return err
+	}
+	if hasSnap {
+		n.snapIndex = meta.LastIncludedIndex
+		n.snapTerm = meta.LastIncludedTerm
+		n.logs[0] = LogEntry{Index: n.snapIndex, Term: n.snapTerm}
+		if err := n.fsm.Restore(data); err != nil {
+			return err
+		}
+		n.commitIndex = n.snapIndex
+		n.lastApplied = n.snapIndex
+		n.log.Info("restored snapshot", "snapIndex", n.snapIndex, "snapTerm", n.snapTerm)
+	}
+
+	entries, err := n.store.LoadLog()
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.Index <= n.snapIndex {
+			continue // 防御性跳过快照已覆盖的残留条目
+		}
+		n.logs = append(n.logs, e)
+	}
+
+	applied, err := n.store.LoadApplied()
+	if err != nil {
+		return err
+	}
+	if applied > n.snapIndex {
+		for idx := n.snapIndex + 1; idx <= applied && idx <= n.lastIndex(); idx++ {
+			n.applyEntry(n.entryAt(idx))
+		}
+		n.lastApplied = applied
+	}
+	if applied > n.commitIndex {
+		n.commitIndex = applied
+	}
+
+	n.log.Info("node started", "term", n.currentTerm, "lastIndex", n.lastIndex(),
+		"commitIndex", n.commitIndex, "lastApplied", n.lastApplied)
+
+	n.resetElectionTimer()
 	n.transport.Register(n.id, n)
 	go n.loop()
 	return nil
@@ -197,12 +258,31 @@ func (n *Node) loop() {
 
 // onTick 处理定时事件：leader 发心跳，其他角色检查选举超时。
 func (n *Node) onTick() {
-	// TODO: 实现于 election.go / replication.go
+	if n.role == RoleLeader {
+		n.broadcastAppend()
+		return
+	}
+	if time.Since(n.lastHeartbeat) >= n.electionDue {
+		n.becomeCandidate()
+	}
 }
 
-// submitProposal 在事件循环内处理新提案（仅 leader 接受）。
-func (n *Node) submitProposal(command []byte, resCh chan proposeResult) {
-	// TODO: 实现于 replication.go
+// deliver 将一段处理逻辑投递回事件循环串行执行。
+// 异步 RPC 的响应必须通过它回投，避免在节点事件循环外读写协议状态。
+func (n *Node) deliver(f func()) {
+	select {
+	case n.events <- f:
+	case <-n.done:
+	}
+}
+
+// applyEntry 把单条已提交条目应用到状态机。
+// Command 为空表示 leader 上任时追加的 no-op，不进入状态机。
+func (n *Node) applyEntry(e LogEntry) any {
+	if len(e.Command) == 0 {
+		return nil
+	}
+	return n.fsm.Apply(e.Index, e.Command)
 }
 
 // failAllWaiters 让所有等待中的提案以 err 失败。
@@ -219,6 +299,14 @@ func (n *Node) failAllWaiters(err error) {
 
 func (n *Node) lastIndex() uint64 { return n.logs[len(n.logs)-1].Index }
 func (n *Node) lastTerm() uint64  { return n.logs[len(n.logs)-1].Term }
+
+// appendLocal 在本节点追加日志并持久化（仅事件循环内调用）。
+func (n *Node) appendLocal(entries ...LogEntry) {
+	n.logs = append(n.logs, entries...)
+	if err := n.store.AppendLog(entries); err != nil {
+		n.log.Error("persist log entries failed", "err", err)
+	}
+}
 
 // entryAt 返回下标 idx 处的条目；idx 落在快照边界时返回哨兵。
 func (n *Node) entryAt(idx uint64) LogEntry {
@@ -245,8 +333,10 @@ func (n *Node) isMember(id string) bool {
 	return false
 }
 
-// resetElectionTimer 随机化选举超时（在 election.go 中补全随机逻辑）。
+// resetElectionTimer 在 [ElectionTimeoutMin, ElectionTimeoutMax] 内随机化超时，
+// 避免多个 follower 同时超时造成的选票分裂。
 func (n *Node) resetElectionTimer() {
 	n.lastHeartbeat = time.Now()
-	n.electionDue = n.cfg.ElectionTimeoutMin // TODO: 随机化
+	span := int64(n.cfg.ElectionTimeoutMax - n.cfg.ElectionTimeoutMin)
+	n.electionDue = n.cfg.ElectionTimeoutMin + time.Duration(rand.Int64N(span+1))
 }

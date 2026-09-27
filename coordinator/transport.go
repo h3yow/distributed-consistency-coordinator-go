@@ -80,18 +80,20 @@ type Transport interface {
 // LocalTransport 是进程内的 Transport 实现，用于本地多节点模拟集群。
 // 支持按节点对注入断链（分区），并可整体启停某个节点的连通性。
 type LocalTransport struct {
-	mu     sync.RWMutex
-	peers  map[string]RPCHandler
-	blocked map[[2]string]bool // 单向断链：blocked[{from,to}]
-	online map[string]bool     // 节点整体在线状态（默认在线）
+	mu       sync.RWMutex
+	peers    map[string]RPCHandler
+	blocked  map[[2]string]bool // 单向断链：blocked[{from,to}]
+	online   map[string]bool    // 节点整体在线状态（默认在线）
+	isolated map[string]bool    // 被整体隔离的节点（与注册顺序无关）
 }
 
 // NewLocalTransport 创建本地传输层。
 func NewLocalTransport() *LocalTransport {
 	return &LocalTransport{
-		peers:   make(map[string]RPCHandler),
-		blocked: make(map[[2]string]bool),
-		online:  make(map[string]bool),
+		peers:    make(map[string]RPCHandler),
+		blocked:  make(map[[2]string]bool),
+		online:   make(map[string]bool),
+		isolated: make(map[string]bool),
 	}
 }
 
@@ -128,22 +130,18 @@ func (t *LocalTransport) Connect(a, b string) {
 }
 
 // Isolate 将 id 与所有其他节点断开（模拟该节点被分区）。
+// 与注册顺序无关：对尚未注册的节点同样生效。
 func (t *LocalTransport) Isolate(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for peer := range t.peers {
-		if peer == id {
-			continue
-		}
-		t.blocked[[2]string{id, peer}] = true
-		t.blocked[[2]string{peer, id}] = true
-	}
+	t.isolated[id] = true
 }
 
 // Heal 恢复 id 与所有节点的链路。
 func (t *LocalTransport) Heal(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	delete(t.isolated, id)
 	for k := range t.blocked {
 		if k[0] == id || k[1] == id {
 			delete(t.blocked, k)
@@ -166,6 +164,9 @@ func (t *LocalTransport) handler(from, to string) (RPCHandler, error) {
 		return nil, ErrUnreachable
 	}
 	if !t.online[from] || !t.online[to] {
+		return nil, ErrUnreachable
+	}
+	if t.isolated[from] || t.isolated[to] {
 		return nil, ErrUnreachable
 	}
 	if t.blocked[[2]string{from, to}] {
