@@ -3,8 +3,8 @@ package coordinator
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -23,8 +23,9 @@ type testCluster struct {
 }
 
 func testLogger(t *testing.T) *slog.Logger {
-	// 单测日志中打印任期、投票、提交位点、快照边界等关键事件。
-	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// 单测日志输出到 stderr（go test -v 可见），
+	// 覆盖任期、投票、提交位点与快照边界等关键事件。
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 }
 
 func newTestCluster(t *testing.T, ids ...string) *testCluster {
