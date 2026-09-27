@@ -1,6 +1,14 @@
 package coordinator
 
-import "sync"
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sync"
+)
 
 // StableState 是需要在选举相关路径上持久化的状态。
 type StableState struct {
@@ -39,23 +47,34 @@ type Storage interface {
 
 // fileStorage 是基于目录文件的 Storage 实现。
 // 目录不存在时自动创建；DataDir 为空时退化为纯内存实现。
+// 每次写入都通过 "临时文件 + rename" 保证原子性。
 type fileStorage struct {
-	mu     sync.Mutex
-	dir    string
-	mem    bool // 纯内存模式
-	stable StableState
-	log    []LogEntry
-	snap   SnapshotMeta
-	snapD  []byte
-	hasSnp bool
+	mu      sync.Mutex
+	dir     string
+	mem     bool // 纯内存模式
+	stable  StableState
+	log     []LogEntry
+	snap    SnapshotMeta
+	snapD   []byte
+	hasSnp  bool
 	applied uint64
 }
+
+const (
+	stableFile   = "stable.json"
+	logFile      = "log.json"
+	snapshotFile = "snapshot.json"
+	appliedFile  = "applied.json"
+)
 
 // NewFileStorage 创建基于 dir 的持久化存储；dir 为空时使用纯内存存储。
 func NewFileStorage(dir string) (Storage, error) {
 	fs := &fileStorage{dir: dir, mem: dir == ""}
 	if fs.mem {
 		return fs, nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("coordinator: create data dir: %w", err)
 	}
 	if err := fs.load(); err != nil {
 		return nil, err
@@ -64,7 +83,71 @@ func NewFileStorage(dir string) (Storage, error) {
 }
 
 func (s *fileStorage) load() error {
-	// TODO: 从目录加载 stable/log/snapshot/applied
+	var stable StableState
+	if err := readJSON(filepath.Join(s.dir, stableFile), &stable); err != nil {
+		return err
+	}
+	s.stable = stable
+
+	var entries []LogEntry
+	if err := readJSON(filepath.Join(s.dir, logFile), &entries); err != nil {
+		return err
+	}
+	s.log = entries
+
+	var snap struct {
+		Meta SnapshotMeta `json:"meta"`
+		Data []byte       `json:"data"`
+	}
+	exists, err := readJSONIfExists(filepath.Join(s.dir, snapshotFile), &snap)
+	if err != nil {
+		return err
+	}
+	if exists {
+		s.snap, s.snapD, s.hasSnp = snap.Meta, snap.Data, true
+	}
+
+	var applied uint64
+	if err := readJSON(filepath.Join(s.dir, appliedFile), &applied); err != nil {
+		return err
+	}
+	s.applied = applied
+	return nil
+}
+
+// readJSON 读取 JSON 文件；文件不存在视为零值。
+func readJSON(path string, v any) error {
+	_, err := readJSONIfExists(path, v)
+	return err
+}
+
+func readJSONIfExists(path string, v any) (bool, error) {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("coordinator: read %s: %w", path, err)
+	}
+	if err := json.Unmarshal(b, v); err != nil {
+		return false, fmt.Errorf("coordinator: decode %s: %w", path, err)
+	}
+	return true, nil
+}
+
+// writeJSONAtomic 先写临时文件再 rename，保证崩溃时不会留下半截文件。
+func writeJSONAtomic(path string, v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return fmt.Errorf("coordinator: write %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("coordinator: rename %s: %w", path, err)
+	}
 	return nil
 }
 
@@ -82,6 +165,9 @@ func (s *fileStorage) LoadStable() (StableState, error) {
 }
 
 func (s *fileStorage) AppendLog(entries []LogEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.log = append(s.log, entries...)
@@ -91,7 +177,13 @@ func (s *fileStorage) AppendLog(entries []LogEntry) error {
 func (s *fileStorage) TruncateLog(from uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// TODO: 截断并持久化
+	keep := s.log[:0]
+	for _, e := range s.log {
+		if e.Index <= from {
+			keep = append(keep, e)
+		}
+	}
+	s.log = keep
 	return s.persistLogLocked()
 }
 
@@ -134,7 +226,33 @@ func (s *fileStorage) LoadApplied() (uint64, error) {
 
 func (s *fileStorage) Close() error { return nil }
 
-func (s *fileStorage) persistStableLocked() error   { return nil } // TODO
-func (s *fileStorage) persistLogLocked() error      { return nil } // TODO
-func (s *fileStorage) persistSnapshotLocked() error { return nil } // TODO
-func (s *fileStorage) persistAppliedLocked() error  { return nil } // TODO
+func (s *fileStorage) persistStableLocked() error {
+	if s.mem {
+		return nil
+	}
+	return writeJSONAtomic(filepath.Join(s.dir, stableFile), s.stable)
+}
+
+func (s *fileStorage) persistLogLocked() error {
+	if s.mem {
+		return nil
+	}
+	return writeJSONAtomic(filepath.Join(s.dir, logFile), s.log)
+}
+
+func (s *fileStorage) persistSnapshotLocked() error {
+	if s.mem {
+		return nil
+	}
+	return writeJSONAtomic(filepath.Join(s.dir, snapshotFile), struct {
+		Meta SnapshotMeta `json:"meta"`
+		Data []byte       `json:"data"`
+	}{Meta: s.snap, Data: s.snapD})
+}
+
+func (s *fileStorage) persistAppliedLocked() error {
+	if s.mem {
+		return nil
+	}
+	return writeJSONAtomic(filepath.Join(s.dir, appliedFile), s.applied)
+}
