@@ -41,6 +41,8 @@ const (
 	ReasonShutdown                  // 节点已停止
 	ReasonTimeout                   // 等待提交超时
 	ReasonDuplicate                 // 重复提案（幂等返回缓存结果）
+	ReasonNotMember                 // 候选人/目标不在当前成员配置中
+	ReasonConfInProgress            // 已有未提交的成员变更，拒绝并发变更
 )
 
 func (r RejectReason) String() string {
@@ -65,6 +67,10 @@ func (r RejectReason) String() string {
 		return "Timeout"
 	case ReasonDuplicate:
 		return "Duplicate"
+	case ReasonNotMember:
+		return "NotMember"
+	case ReasonConfInProgress:
+		return "ConfInProgress"
 	}
 	return "Unknown"
 }

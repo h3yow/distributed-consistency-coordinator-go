@@ -5,11 +5,31 @@ import (
 	"time"
 )
 
-// snapshotEnvelope 快照信封：状态机数据 + 提案去重状态，
-// 保证安装快照的节点与生成方在去重视图上一致。
+// snapshotEnvelope 快照信封：状态机数据 + 提案去重状态 + 成员配置，
+// 保证安装快照的节点与生成方在去重视图和成员列表上一致。
 type snapshotEnvelope struct {
-	SMData  []byte            `json:"sm"`
-	LastSeq map[string]uint64 `json:"seq"`
+	SMData   []byte            `json:"sm"`
+	LastSeq  map[string]uint64 `json:"seq"`
+	Voters   []NodeID          `json:"voters,omitempty"`
+	Learners []NodeID          `json:"learners,omitempty"`
+}
+
+// snapshotMembership 从快照数据中解出成员配置；快照不含成员信息（旧格式）时返回 false。
+func snapshotMembership(data []byte) (membership, bool) {
+	var env snapshotEnvelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		return membership{}, false
+	}
+	if len(env.Voters) == 0 && len(env.Learners) == 0 {
+		return membership{}, false
+	}
+	m := newMembership(env.Voters)
+	for _, id := range env.Learners {
+		if !m.Voters[id] {
+			m.Learners[id] = true
+		}
+	}
+	return m, true
 }
 
 // maybeSnapshotLocked 在日志超过阈值时，基于已应用（必已提交）状态生成快照。
@@ -29,7 +49,14 @@ func (n *Node) maybeSnapshotLocked() {
 		n.logf("snapshot failed: %v", err)
 		return
 	}
-	env, err := json.Marshal(snapshotEnvelope{SMData: smData, LastSeq: n.lastSeq})
+	// 快照携带的是已提交配置（lastApplied 必已提交），
+	// 不含日志尾部尚未提交的变更，保证快照边界语义精确。
+	env, err := json.Marshal(snapshotEnvelope{
+		SMData:   smData,
+		LastSeq:  n.lastSeq,
+		Voters:   n.committedMem.voterList(),
+		Learners: n.committedMem.learnerList(),
+	})
 	if err != nil {
 		n.logf("snapshot encode failed: %v", err)
 		return
@@ -41,7 +68,9 @@ func (n *Node) maybeSnapshotLocked() {
 		return
 	}
 	n.log = n.store.Entries()
-	n.logf("snapshot created boundary=%d/%d commitIndex=%d", snapIndex, snapTerm, n.commitIndex)
+	// 快照边界推进：快照中的已提交配置成为新的重算基线。
+	n.snapMem = n.committedMem.clone()
+	n.logf("snapshot created boundary=%d/%d commitIndex=%d membership=%s", snapIndex, snapTerm, n.commitIndex, n.committedMem)
 }
 
 // restoreSnapshotLocked 用快照数据恢复状态机与去重状态（不触碰日志，由调用方维护）。
@@ -111,8 +140,15 @@ func (n *Node) handleInstallSnapshotLocked(m *Message) {
 	}
 	n.log = n.store.Entries()
 	n.restoreSnapshotLocked(m.SnapshotIndex, m.SnapshotData)
+	// 快照中的成员配置成为新基线，叠加日志后缀中的变更。
+	if sm, ok := snapshotMembership(m.SnapshotData); ok {
+		n.snapMem = sm
+		n.committedMem = sm
+	}
+	n.recomputeMembershipLocked()
 	_ = n.store.SaveApplyState(n.lastApplied, n.lastSeq, n.lastResult)
-	n.logf("snapshot installed boundary=%d/%d commitIndex=%d", m.SnapshotIndex, m.SnapshotTerm, n.commitIndex)
+	n.logf("snapshot installed boundary=%d/%d commitIndex=%d membership=%s",
+		m.SnapshotIndex, m.SnapshotTerm, n.commitIndex, n.mem)
 
 	reply.Success = true
 	reply.MatchIndex = m.SnapshotIndex

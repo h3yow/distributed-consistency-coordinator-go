@@ -38,9 +38,18 @@ func newCluster(t *testing.T, size int, snapshotThreshold int) *testCluster {
 }
 
 func (c *testCluster) start(id NodeID) {
+	// 初始成员用静态 Peers 启动；后加入的节点以未配置身份启动，
+	// 成员信息从存储（快照+日志）恢复。
+	peers := []NodeID(nil)
+	for _, pid := range c.ids {
+		if pid == id {
+			peers = c.ids
+			break
+		}
+	}
 	cfg := Config{
 		ID:                 id,
-		Peers:              c.ids,
+		Peers:              peers,
 		HeartbeatInterval:  20 * time.Millisecond,
 		ElectionTimeoutMin: 80 * time.Millisecond,
 		ElectionTimeoutMax: 160 * time.Millisecond,
@@ -74,29 +83,57 @@ func (c *testCluster) restart(id NodeID) {
 }
 
 func (c *testCluster) stopAll() {
-	for _, id := range c.ids {
+	for id := range c.nodes {
 		c.stop(id)
 	}
 }
 
-// waitLeader 等待选出一个 leader 且多数节点认可，返回 leader。
+// addJoiningNode 以未配置身份启动一个新节点（Peers 为空）：
+// 模拟新机器上线，不发起选举、不投票，等待被 AddNode 拉入集群。
+func (c *testCluster) addJoiningNode(id NodeID) {
+	c.t.Helper()
+	c.stores[id] = NewMemoryStorage()
+	c.machines[id] = NewKVMachine()
+	cfg := Config{
+		ID:                 id,
+		Peers:              nil, // 未配置：等待集群成员变更纳入
+		HeartbeatInterval:  20 * time.Millisecond,
+		ElectionTimeoutMin: 80 * time.Millisecond,
+		ElectionTimeoutMax: 160 * time.Millisecond,
+		SnapshotThreshold:  c.snapTh,
+		EnableLog:          true,
+	}
+	n := NewNode(cfg, c.stores[id], c.net, c.machines[id])
+	c.nodes[id] = n
+	n.Start()
+}
+
+// membershipOf 收集所有运行中节点的成员配置视图。
+func (c *testCluster) membershipOf() map[NodeID]string {
+	out := make(map[NodeID]string)
+	for id, n := range c.nodes {
+		voters, learners := n.Membership()
+		out[id] = fmt.Sprintf("voters=%v learners=%v", voters, learners)
+	}
+	return out
+}
+
+// waitLeader 等待选出一个 leader 且多数运行中节点认可，返回 leader。
 func (c *testCluster) waitLeader(timeout time.Duration) *Node {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		for _, id := range c.ids {
-			n, ok := c.nodes[id]
-			if !ok || n.Role() != RoleLeader {
+		for id, n := range c.nodes {
+			if n.Role() != RoleLeader {
 				continue
 			}
-			// 确认多数节点认可该 leader 且任期一致
+			// 确认多数运行中节点认可该 leader 且任期一致
 			agree := 0
-			for _, oid := range c.ids {
-				on, ok := c.nodes[oid]
-				if ok && on.LeaderID() == id && on.Term() == n.Term() {
+			for _, on := range c.nodes {
+				if on.LeaderID() == id && on.Term() == n.Term() {
 					agree++
 				}
 			}
-			if agree > len(c.ids)/2 {
+			if agree > len(c.nodes)/2 {
 				return n
 			}
 		}
@@ -110,19 +147,17 @@ func (c *testCluster) waitLeader(timeout time.Duration) *Node {
 func (c *testCluster) waitLeaderMinTerm(minTerm uint64, timeout time.Duration) *Node {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		for _, id := range c.ids {
-			n, ok := c.nodes[id]
-			if !ok || n.Role() != RoleLeader || n.Term() <= minTerm {
+		for id, n := range c.nodes {
+			if n.Role() != RoleLeader || n.Term() <= minTerm {
 				continue
 			}
 			agree := 0
-			for _, oid := range c.ids {
-				on, ok := c.nodes[oid]
-				if ok && on.LeaderID() == id && on.Term() == n.Term() {
+			for _, on := range c.nodes {
+				if on.LeaderID() == id && on.Term() == n.Term() {
 					agree++
 				}
 			}
-			if agree > len(c.ids)/2 {
+			if agree > len(c.nodes)/2 {
 				return n
 			}
 		}

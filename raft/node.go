@@ -44,6 +44,11 @@ type Node struct {
 	lastResult map[string]any    // clientID -> 最近一次应用结果
 	pending    map[uint64]chan proposalResult
 
+	// 成员配置（由日志中的成员变更条目派生，可在线变更）
+	mem          membership // 当前生效配置（含未提交变更，截断时回滚重算）
+	committedMem membership // 已提交配置（快照携带的就是它，保证快照边界语义正确）
+	snapMem      membership // 快照边界处的配置（重算起点）
+
 	stopCh  chan struct{}
 	stopped bool
 }
@@ -76,6 +81,8 @@ func NewNode(cfg Config, store Storage, net *Network, sm StateMachine) *Node {
 		lastSeq:    make(map[string]uint64),
 		lastResult: make(map[string]any),
 		pending:    make(map[uint64]chan proposalResult),
+		mem:        newMembership(cfg.Peers),
+		snapMem:    newMembership(cfg.Peers),
 	}
 	if cfg.EnableLog {
 		n.lg = log.New(os.Stderr, "[node "+string(cfg.ID)+"] ", log.LstdFlags|log.Lmicroseconds)
@@ -100,8 +107,12 @@ func (n *Node) Start() {
 	applied, lastSeq, lastResult, _ := n.store.LoadApplyState()
 	n.lastSeq, n.lastResult = lastSeq, lastResult
 	// 重放快照之后、已应用位点之前的已提交日志，重建状态机。
+	// 成员变更条目不进状态机，已在上面重建成员配置时处理。
 	base := n.log[0].Index
 	for i := base + 1; i <= applied; i++ {
+		if _, isConf := decodeConfOp(n.log[i-base].Op); isConf {
+			continue
+		}
 		n.sm.Apply(n.log[i-base].Op)
 	}
 	n.commitIndex, n.lastApplied = applied, applied
@@ -112,9 +123,27 @@ func (n *Node) Start() {
 	n.lastContact = time.Now()
 	n.resetElectionTimeoutLocked()
 
+	// 成员配置：以快照中的配置为基线，叠加日志中的成员变更条目。
+	// 快照不含成员信息（旧格式）时退回启动配置的静态成员列表。
+	n.snapMem = newMembership(n.cfg.Peers)
+	if sm, ok := snapshotMembership(snapData); ok {
+		n.snapMem = sm
+	}
+	n.mem = n.snapMem
+	n.committedMem = n.snapMem
+	for _, e := range n.log[1:] {
+		if ce, ok := decodeConfOp(e.Op); ok {
+			n.mem = membershipFromLists(ce.Voters, ce.Learners)
+			if e.Index <= applied {
+				n.committedMem = n.mem
+			}
+		}
+	}
+
 	n.net.Register(n.cfg.ID, n.HandleMessage)
 	go n.run()
-	n.logf("started term=%d commitIndex=%d snapshotBoundary=%d", n.currentTerm, n.commitIndex, snapIndex)
+	n.logf("started term=%d commitIndex=%d snapshotBoundary=%d membership=%s",
+		n.currentTerm, n.commitIndex, snapIndex, n.mem)
 }
 
 // Stop 停止节点（模拟进程退出，存储保留，可重新 Start 模拟重启）。
@@ -261,6 +290,13 @@ func (n *Node) resetElectionTimeoutLocked() {
 // ---------------- 内部：选举 ----------------
 
 func (n *Node) startElectionLocked() {
+	// 只有当前配置中的 voter 才能发起选举：
+	// learner、未配置的新节点、已被移除的节点都不会发起选举，避免干扰集群。
+	if !n.mem.Voters[n.cfg.ID] {
+		n.lastContact = time.Now()
+		n.resetElectionTimeoutLocked()
+		return
+	}
 	n.role = RoleCandidate
 	n.currentTerm++
 	n.votedFor = n.cfg.ID
@@ -270,12 +306,12 @@ func (n *Node) startElectionLocked() {
 	n.lastContact = time.Now()
 	n.resetElectionTimeoutLocked()
 	lastIdx, lastTerm := n.lastIndexTermLocked()
-	n.logf("election start term=%d lastLog=%d/%d", n.currentTerm, lastIdx, lastTerm)
+	n.logf("election start term=%d lastLog=%d/%d membership=%s", n.currentTerm, lastIdx, lastTerm, n.mem)
 	if n.quorumReachedLocked(len(n.votes)) {
 		n.becomeLeaderLocked()
 		return
 	}
-	for _, p := range n.cfg.Peers {
+	for _, p := range n.mem.voterList() {
 		if p == n.cfg.ID {
 			continue
 		}
@@ -294,6 +330,14 @@ func (n *Node) handleRequestVoteLocked(m *Message) {
 		n.sendLocked(reply)
 		return
 	}
+	// 非当前配置成员的候选人直接拒绝，且不随其任期升降：
+	// 已被移除的节点无法用更高任期打断现有集群。
+	if !n.mem.Voters[m.From] {
+		reply.Reason = ReasonNotMember
+		n.logf("vote reject candidate=%s reason=%s membership=%s", m.From, reply.Reason, n.mem)
+		n.sendLocked(reply)
+		return
+	}
 	if m.Term > n.currentTerm {
 		n.becomeFollowerLocked(m.Term, "")
 	}
@@ -301,6 +345,9 @@ func (n *Node) handleRequestVoteLocked(m *Message) {
 	myLastIdx, myLastTerm := n.lastIndexTermLocked()
 	upToDate := m.LastLogTerm > myLastTerm || (m.LastLogTerm == myLastTerm && m.LastLogIndex >= myLastIdx)
 	switch {
+	case !n.mem.Voters[n.cfg.ID]:
+		// learner / 未配置节点不参与投票。
+		reply.Reason = ReasonNotMember
 	case n.votedFor != "" && n.votedFor != m.From:
 		reply.Reason = ReasonAlreadyVoted
 	case !upToDate:
@@ -326,7 +373,7 @@ func (n *Node) handleRequestVoteReplyLocked(m *Message) {
 		return
 	}
 	n.votes[m.From] = true
-	n.logf("vote received from=%s term=%d votes=%d/%d", m.From, n.currentTerm, len(n.votes), len(n.cfg.Peers))
+	n.logf("vote received from=%s term=%d votes=%d/%d", m.From, n.currentTerm, len(n.votes), len(n.mem.Voters))
 	if n.quorumReachedLocked(len(n.votes)) {
 		n.becomeLeaderLocked()
 	}
@@ -353,23 +400,33 @@ func (n *Node) becomeLeaderLocked() {
 	lastIdx, _ := n.lastIndexTermLocked()
 	n.nextIndex = make(map[NodeID]uint64)
 	n.matchIndex = make(map[NodeID]uint64)
-	for _, p := range n.cfg.Peers {
+	for _, p := range n.mem.replicationTargets() {
 		n.nextIndex[p] = lastIdx + 1
 		n.matchIndex[p] = 0
 	}
 	n.matchIndex[n.cfg.ID] = lastIdx
-	n.logf("became leader term=%d lastIndex=%d", n.currentTerm, lastIdx)
+	n.logf("became leader term=%d lastIndex=%d membership=%s", n.currentTerm, lastIdx, n.mem)
 	n.broadcastAppendLocked()
 }
 
 func (n *Node) quorumReachedLocked(count int) bool {
-	return count > len(n.cfg.Peers)/2
+	return count > len(n.mem.Voters)/2
 }
 
 // ---------------- 内部：日志复制 ----------------
 
 func (n *Node) broadcastAppendLocked() {
-	for _, p := range n.cfg.Peers {
+	// 复制目标 = 当前成员 ∪ 复制进度表中残留的节点：
+	// 被移除节点在移除条目提交前仍会收到复制（让它亲眼看到自己被移除），
+	// 提交后其进度表项被清理，自然停止。
+	targets := make(map[NodeID]bool)
+	for _, p := range n.mem.replicationTargets() {
+		targets[p] = true
+	}
+	for p := range n.nextIndex {
+		targets[p] = true
+	}
+	for p := range targets {
 		if p == n.cfg.ID {
 			continue
 		}
@@ -452,11 +509,15 @@ func (n *Node) handleAppendEntriesLocked(m *Message) {
 				e.Index, n.log[off].Term, e.Term)
 			n.log = n.log[:off]
 			_ = n.store.TruncateSuffix(e.Index)
+			// 被截断的未提交成员变更一并回滚。
+			n.recomputeMembershipLocked()
 			n.log = append(n.log, e)
 			_ = n.store.Append([]LogEntry{e})
+			n.applyConfEntryLocked(e)
 		case int(off) >= len(n.log):
 			n.log = append(n.log, e)
 			_ = n.store.Append([]LogEntry{e})
+			n.applyConfEntryLocked(e)
 		}
 	}
 
@@ -508,6 +569,7 @@ func (n *Node) handleAppendEntriesReplyLocked(m *Message) {
 }
 
 // advanceCommitLocked 仅提交当前任期的条目（Raft 安全规则），多数确认后推进。
+// 多数派按当前生效的 voter 集合计算。
 func (n *Node) advanceCommitLocked() {
 	base := n.log[0].Index
 	lastIdx, _ := n.lastIndexTermLocked()
@@ -515,8 +577,11 @@ func (n *Node) advanceCommitLocked() {
 		if n.log[i-base].Term != n.currentTerm {
 			continue
 		}
-		count := 1
-		for _, p := range n.cfg.Peers {
+		count := 0
+		if n.mem.Voters[n.cfg.ID] {
+			count = 1 // 自己只在仍是 voter 时计入多数派（处理移除自己的变更）
+		}
+		for p := range n.mem.Voters {
 			if p != n.cfg.ID && n.matchIndex[p] >= i {
 				count++
 			}
@@ -531,11 +596,30 @@ func (n *Node) advanceCommitLocked() {
 }
 
 // applyLocked 将已提交条目按序应用到状态机，带提案去重与等待者唤醒。
+// 成员变更条目不进状态机：提交时记录日志，被移除的 leader 在此卸任。
 func (n *Node) applyLocked() {
 	base := n.log[0].Index
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
 		e := n.log[n.lastApplied-base]
+		if ce, isConf := decodeConfOp(e.Op); isConf {
+			n.committedMem = membershipFromLists(ce.Voters, ce.Learners)
+			n.logf("membership change committed index=%d change=%s node=%s membership=%s",
+				e.Index, ce.Type, ce.NodeID, n.mem)
+			if ce.Type == ConfRemove {
+				// 移除已提交：停止向该节点复制。
+				delete(n.nextIndex, ce.NodeID)
+				delete(n.matchIndex, ce.NodeID)
+			}
+			if ch, ok := n.pending[e.Index]; ok {
+				ch <- proposalResult{result: "membership: " + n.mem.String()}
+				delete(n.pending, e.Index)
+			}
+			if ce.Type == ConfRemove && ce.NodeID == n.cfg.ID {
+				n.onSelfRemovedLocked()
+			}
+			continue
+		}
 		var res any
 		if e.ClientID != "" && n.lastSeq[e.ClientID] >= e.Seq {
 			// 重复条目：幂等返回缓存结果，不重复应用。
@@ -556,6 +640,50 @@ func (n *Node) applyLocked() {
 	_ = n.store.SaveApplyState(n.lastApplied, n.lastSeq, n.lastResult)
 	n.logf("applied up to %d commitIndex=%d", n.lastApplied, n.commitIndex)
 	n.maybeSnapshotLocked()
+}
+
+// onSelfRemovedLocked 本节点被移出集群的提交点处理：
+// 卸任并不再参与选举（成员配置中已无自己，startElection 也会拒绝）。
+func (n *Node) onSelfRemovedLocked() {
+	n.logf("removed from cluster at committed config, step down term=%d membership=%s", n.currentTerm, n.mem)
+	if n.role == RoleLeader {
+		n.failPendingLocked(&RejectError{Reason: ReasonNotMember, Detail: "leader removed from cluster"})
+	}
+	n.role = RoleFollower
+	n.leaderID = ""
+}
+
+// applyConfEntryLocked 在条目进入日志时应用成员变更（追加即生效，
+// 与 Raft 单节点变更语义一致；未提交变更被截断时由 recomputeMembershipLocked 回滚）。
+// 条目携带变更后的完整配置，直接采用。
+func (n *Node) applyConfEntryLocked(e LogEntry) {
+	ce, ok := decodeConfOp(e.Op)
+	if !ok {
+		return
+	}
+	n.mem = membershipFromLists(ce.Voters, ce.Learners)
+	n.logf("membership change appended index=%d change=%s node=%s membership=%s",
+		e.Index, ce.Type, ce.NodeID, n.mem)
+	// leader 需要把新成员纳入复制进度表（新 learner 从最新位置开始，靠回退/快照追平）。
+	if n.role == RoleLeader && n.mem.contains(ce.NodeID) {
+		if _, ok := n.nextIndex[ce.NodeID]; !ok {
+			lastIdx, _ := n.lastIndexTermLocked()
+			n.nextIndex[ce.NodeID] = lastIdx + 1
+			n.matchIndex[ce.NodeID] = 0
+		}
+	}
+}
+
+// recomputeMembershipLocked 从快照基线 + 当前日志重放全部成员变更，
+// 用于未提交变更被截断后的回滚。
+func (n *Node) recomputeMembershipLocked() {
+	n.mem = n.snapMem
+	for _, e := range n.log[1:] {
+		if ce, ok := decodeConfOp(e.Op); ok {
+			n.mem = membershipFromLists(ce.Voters, ce.Learners)
+		}
+	}
+	n.logf("membership recomputed membership=%s", n.mem)
 }
 
 // ---------------- 内部：工具 ----------------
