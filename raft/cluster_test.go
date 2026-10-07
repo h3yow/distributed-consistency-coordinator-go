@@ -9,13 +9,15 @@ import (
 
 // testCluster 本地多节点测试集群。
 type testCluster struct {
-	t        *testing.T
-	net      *Network
-	ids      []NodeID
-	stores   map[NodeID]*MemoryStorage
-	machines map[NodeID]*KVMachine
-	nodes    map[NodeID]*Node
-	snapTh   int
+	t         *testing.T
+	net       *Network
+	ids       []NodeID
+	bootstrap []NodeID // 初始引导的投票成员（用于全新节点的 Config.Peers）
+	stores    map[NodeID]*MemoryStorage
+	machines  map[NodeID]*KVMachine
+	nodes     map[NodeID]*Node
+	learner   map[NodeID]bool // 以 learner 身份启动的节点（重启时保持该身份）
+	snapTh    int
 }
 
 func newCluster(t *testing.T, size int, snapshotThreshold int) *testCluster {
@@ -26,21 +28,42 @@ func newCluster(t *testing.T, size int, snapshotThreshold int) *testCluster {
 		stores:   make(map[NodeID]*MemoryStorage),
 		machines: make(map[NodeID]*KVMachine),
 		nodes:    make(map[NodeID]*Node),
+		learner:  make(map[NodeID]bool),
 		snapTh:   snapshotThreshold,
 	}
 	for i := 0; i < size; i++ {
 		id := NodeID(fmt.Sprintf("N%d", i+1))
 		c.ids = append(c.ids, id)
+		c.bootstrap = append(c.bootstrap, id)
 		c.stores[id] = NewMemoryStorage()
 		c.machines[id] = NewKVMachine()
 	}
 	return c
 }
 
+// addLearnerNode 向集群加入一个以 learner 身份启动的新节点进程。
+func (c *testCluster) addLearnerNode(id NodeID) {
+	c.t.Helper()
+	if _, ok := c.stores[id]; ok {
+		c.t.Fatalf("node %s already exists", id)
+	}
+	c.ids = append(c.ids, id)
+	c.stores[id] = NewMemoryStorage()
+	c.machines[id] = NewKVMachine()
+	c.learner[id] = true
+	c.start(id)
+}
+
 func (c *testCluster) start(id NodeID) {
+	peers := c.bootstrap
+	learner := c.learner[id]
+	if learner {
+		peers = nil // learner 不参与初始引导配置，成员资格由集群日志下发
+	}
 	cfg := Config{
 		ID:                 id,
-		Peers:              c.ids,
+		Peers:              peers,
+		Learner:            learner,
 		HeartbeatInterval:  20 * time.Millisecond,
 		ElectionTimeoutMin: 80 * time.Millisecond,
 		ElectionTimeoutMax: 160 * time.Millisecond,

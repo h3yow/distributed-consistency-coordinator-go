@@ -30,6 +30,10 @@ type Node struct {
 	lastApplied uint64
 	leaderID    NodeID
 
+	// 已提交生效的成员配置（重建来源：初始 Config / 快照 / 已提交日志回放）
+	members  map[NodeID]bool // 投票成员：参与选举与多数派计算
+	learners map[NodeID]bool // 非投票成员：只接收复制，不计入多数派
+
 	// 选举计时
 	lastContact     time.Time
 	electionTimeout time.Duration
@@ -38,6 +42,9 @@ type Node struct {
 	// leader 易失状态
 	nextIndex  map[NodeID]uint64
 	matchIndex map[NodeID]uint64
+	// 已被移除但尚未确认收到移除条目的节点：继续复制直到其确认，
+	// 让被移除节点亲知自己已退出，从而停止参选。
+	removedAck map[NodeID]uint64
 
 	// 提案去重与等待
 	lastSeq    map[string]uint64 // clientID -> 已应用的最大 Seq
@@ -73,9 +80,21 @@ func NewNode(cfg Config, store Storage, net *Network, sm StateMachine) *Node {
 		votes:      make(map[NodeID]bool),
 		nextIndex:  make(map[NodeID]uint64),
 		matchIndex: make(map[NodeID]uint64),
+		removedAck: make(map[NodeID]uint64),
 		lastSeq:    make(map[string]uint64),
 		lastResult: make(map[string]any),
 		pending:    make(map[uint64]chan proposalResult),
+		members:    make(map[NodeID]bool),
+		learners:   make(map[NodeID]bool),
+	}
+	// 初始成员配置：全新集群由 Config.Peers 引导；learner 节点初始无投票权，
+	// 真实配置随后由快照与已提交日志回放重建（见 Start）。
+	if cfg.Learner {
+		n.learners[cfg.ID] = true
+	} else {
+		for _, p := range cfg.Peers {
+			n.members[p] = true
+		}
 	}
 	if cfg.EnableLog {
 		n.lg = log.New(os.Stderr, "[node "+string(cfg.ID)+"] ", log.LstdFlags|log.Lmicroseconds)
@@ -99,10 +118,16 @@ func (n *Node) Start() {
 
 	applied, lastSeq, lastResult, _ := n.store.LoadApplyState()
 	n.lastSeq, n.lastResult = lastSeq, lastResult
-	// 重放快照之后、已应用位点之前的已提交日志，重建状态机。
+	// 重放快照之后、已应用位点之前的已提交日志，重建状态机与成员配置。
 	base := n.log[0].Index
 	for i := base + 1; i <= applied; i++ {
-		n.sm.Apply(n.log[i-base].Op)
+		e := n.log[i-base]
+		switch {
+		case e.Type.IsConfig():
+			n.applyConfigLocked(e)
+		case e.Type == EntryNormal:
+			n.sm.Apply(e.Op)
+		}
 	}
 	n.commitIndex, n.lastApplied = applied, applied
 
@@ -114,7 +139,8 @@ func (n *Node) Start() {
 
 	n.net.Register(n.cfg.ID, n.HandleMessage)
 	go n.run()
-	n.logf("started term=%d commitIndex=%d snapshotBoundary=%d", n.currentTerm, n.commitIndex, snapIndex)
+	n.logf("started term=%d commitIndex=%d snapshotBoundary=%d members=%v learners=%v",
+		n.currentTerm, n.commitIndex, snapIndex, sortedKeysLocked(n.members), sortedKeysLocked(n.learners))
 }
 
 // Stop 停止节点（模拟进程退出，存储保留，可重新 Start 模拟重启）。
@@ -245,7 +271,8 @@ func (n *Node) run() {
 			}
 			if n.role == RoleLeader {
 				n.broadcastAppendLocked()
-			} else if time.Since(n.lastContact) >= n.electionTimeout {
+			} else if n.isVoterLocked() && time.Since(n.lastContact) >= n.electionTimeout {
+				// 仅投票成员可发起选举；learner 与已移除节点永不参选。
 				n.startElectionLocked()
 			}
 			n.mu.Unlock()
@@ -270,12 +297,12 @@ func (n *Node) startElectionLocked() {
 	n.lastContact = time.Now()
 	n.resetElectionTimeoutLocked()
 	lastIdx, lastTerm := n.lastIndexTermLocked()
-	n.logf("election start term=%d lastLog=%d/%d", n.currentTerm, lastIdx, lastTerm)
+	n.logf("election start term=%d lastLog=%d/%d members=%v", n.currentTerm, lastIdx, lastTerm, sortedKeysLocked(n.members))
 	if n.quorumReachedLocked(len(n.votes)) {
 		n.becomeLeaderLocked()
 		return
 	}
-	for _, p := range n.cfg.Peers {
+	for p := range n.members {
 		if p == n.cfg.ID {
 			continue
 		}
@@ -291,6 +318,21 @@ func (n *Node) handleRequestVoteLocked(m *Message) {
 	if m.Term < n.currentTerm {
 		reply.Reason = ReasonStaleTerm
 		n.logf("vote reject candidate=%s reason=%s myTerm=%d msgTerm=%d", m.From, reply.Reason, n.currentTerm, m.Term)
+		n.sendLocked(reply)
+		return
+	}
+	// 非投票成员的候选人一律拒绝，且不随其任期更新本地状态：
+	// 已被移出集群的节点不能凭旧身份抬升任期、扰乱现有 leader。
+	if !n.members[m.From] {
+		reply.Reason = ReasonNotMember
+		n.logf("vote reject candidate=%s reason=%s term=%d members=%v", m.From, reply.Reason, n.currentTerm, sortedKeysLocked(n.members))
+		n.sendLocked(reply)
+		return
+	}
+	// learner 与已移除节点自身不投票。
+	if !n.isVoterLocked() {
+		reply.Reason = ReasonNotMember
+		n.logf("vote reject candidate=%s reason=%s(self non-voter) term=%d", m.From, reply.Reason, n.currentTerm)
 		n.sendLocked(reply)
 		return
 	}
@@ -325,8 +367,11 @@ func (n *Node) handleRequestVoteReplyLocked(m *Message) {
 	if n.role != RoleCandidate || m.Term != n.currentTerm || !m.Success {
 		return
 	}
+	if !n.members[m.From] {
+		return // 只统计投票成员的选票
+	}
 	n.votes[m.From] = true
-	n.logf("vote received from=%s term=%d votes=%d/%d", m.From, n.currentTerm, len(n.votes), len(n.cfg.Peers))
+	n.logf("vote received from=%s term=%d votes=%d/%d", m.From, n.currentTerm, len(n.votes), len(n.members))
 	if n.quorumReachedLocked(len(n.votes)) {
 		n.becomeLeaderLocked()
 	}
@@ -353,26 +398,43 @@ func (n *Node) becomeLeaderLocked() {
 	lastIdx, _ := n.lastIndexTermLocked()
 	n.nextIndex = make(map[NodeID]uint64)
 	n.matchIndex = make(map[NodeID]uint64)
-	for _, p := range n.cfg.Peers {
+	// 投票成员假设已同步（按需回退）；learner 从头（或快照）追赶。
+	for p := range n.members {
 		n.nextIndex[p] = lastIdx + 1
 		n.matchIndex[p] = 0
 	}
+	for p := range n.learners {
+		n.nextIndex[p] = 1
+		n.matchIndex[p] = 0
+	}
 	n.matchIndex[n.cfg.ID] = lastIdx
-	n.logf("became leader term=%d lastIndex=%d", n.currentTerm, lastIdx)
+	// 接力未完成的移除确认：扫描已提交日志中的移除条目，
+	// 对仍不在成员配置中的目标继续复制，直到其确认收到移除。
+	n.removedAck = make(map[NodeID]uint64)
+	base := n.log[0].Index
+	for i := base + 1; i <= n.commitIndex; i++ {
+		e := n.log[i-base]
+		if e.Type == EntryRemoveNode && e.NodeID != n.cfg.ID && !n.members[e.NodeID] && !n.learners[e.NodeID] {
+			n.removedAck[e.NodeID] = e.Index
+			if _, ok := n.nextIndex[e.NodeID]; !ok {
+				n.nextIndex[e.NodeID] = 1
+				n.matchIndex[e.NodeID] = 0
+			}
+		}
+	}
+	n.logf("became leader term=%d lastIndex=%d members=%v learners=%v",
+		n.currentTerm, lastIdx, sortedKeysLocked(n.members), sortedKeysLocked(n.learners))
 	n.broadcastAppendLocked()
 }
 
 func (n *Node) quorumReachedLocked(count int) bool {
-	return count > len(n.cfg.Peers)/2
+	return count > len(n.members)/2
 }
 
 // ---------------- 内部：日志复制 ----------------
 
 func (n *Node) broadcastAppendLocked() {
-	for _, p := range n.cfg.Peers {
-		if p == n.cfg.ID {
-			continue
-		}
+	for _, p := range n.replicationTargetsLocked() {
 		n.sendAppendToLocked(p)
 	}
 }
@@ -418,6 +480,7 @@ func (n *Node) handleAppendEntriesLocked(m *Message) {
 			reply.Success = true
 			reply.MatchIndex = base
 			n.advanceCommitFromLeaderLocked(m.LeaderCommit)
+			reply.CommitIndex = n.commitIndex
 			n.sendLocked(reply)
 			return
 		}
@@ -466,6 +529,7 @@ func (n *Node) handleAppendEntriesLocked(m *Message) {
 		reply.MatchIndex = base
 	}
 	n.advanceCommitFromLeaderLocked(m.LeaderCommit)
+	reply.CommitIndex = n.commitIndex
 	n.sendLocked(reply)
 }
 
@@ -493,6 +557,7 @@ func (n *Node) handleAppendEntriesReplyLocked(m *Message) {
 			n.matchIndex[m.From] = m.MatchIndex
 		}
 		n.nextIndex[m.From] = n.matchIndex[m.From] + 1
+		n.maybeDropRemovedLocked(m.From, m.CommitIndex)
 		n.advanceCommitLocked()
 		return
 	}
@@ -508,6 +573,7 @@ func (n *Node) handleAppendEntriesReplyLocked(m *Message) {
 }
 
 // advanceCommitLocked 仅提交当前任期的条目（Raft 安全规则），多数确认后推进。
+// 多数派按当前已提交生效的投票成员配置计算；learner 不计入。
 func (n *Node) advanceCommitLocked() {
 	base := n.log[0].Index
 	lastIdx, _ := n.lastIndexTermLocked()
@@ -515,8 +581,11 @@ func (n *Node) advanceCommitLocked() {
 		if n.log[i-base].Term != n.currentTerm {
 			continue
 		}
-		count := 1
-		for _, p := range n.cfg.Peers {
+		count := 0
+		if n.isVoterLocked() {
+			count = 1
+		}
+		for p := range n.members {
 			if p != n.cfg.ID && n.matchIndex[p] >= i {
 				count++
 			}
@@ -531,17 +600,23 @@ func (n *Node) advanceCommitLocked() {
 }
 
 // applyLocked 将已提交条目按序应用到状态机，带提案去重与等待者唤醒。
+// 成员变更条目不进入业务状态机，而是直接更新成员配置（幂等集合操作）。
 func (n *Node) applyLocked() {
 	base := n.log[0].Index
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
 		e := n.log[n.lastApplied-base]
 		var res any
-		if e.ClientID != "" && n.lastSeq[e.ClientID] >= e.Seq {
+		switch {
+		case e.Type.IsConfig():
+			n.applyConfigLocked(e)
+		case e.Type == EntryNoop:
+			// 空条目：仅用于推进提交位点，不进入状态机
+		case e.ClientID != "" && n.lastSeq[e.ClientID] >= e.Seq:
 			// 重复条目：幂等返回缓存结果，不重复应用。
 			res = n.lastResult[e.ClientID]
 			n.logf("apply skip duplicate index=%d client=%s seq=%d", e.Index, e.ClientID, e.Seq)
-		} else {
+		default:
 			res = n.sm.Apply(e.Op)
 			if e.ClientID != "" {
 				n.lastSeq[e.ClientID] = e.Seq
@@ -555,6 +630,17 @@ func (n *Node) applyLocked() {
 	}
 	_ = n.store.SaveApplyState(n.lastApplied, n.lastSeq, n.lastResult)
 	n.logf("applied up to %d commitIndex=%d", n.lastApplied, n.commitIndex)
+	// 自身已被移出集群：立即退位并终止在途提案，此后不再参选、不再计票。
+	if !n.isVoterLocked() && !n.learners[n.cfg.ID] {
+		if n.role != RoleFollower || n.leaderID == n.cfg.ID {
+			n.logf("removed from cluster, step down term=%d commitIndex=%d", n.currentTerm, n.commitIndex)
+		}
+		if n.role == RoleLeader {
+			n.failPendingLocked(&RejectError{Reason: ReasonStaleTerm, Detail: "leader removed from cluster"})
+		}
+		n.role = RoleFollower
+		n.leaderID = ""
+	}
 	n.maybeSnapshotLocked()
 }
 

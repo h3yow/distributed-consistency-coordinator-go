@@ -41,6 +41,8 @@ const (
 	ReasonShutdown                  // 节点已停止
 	ReasonTimeout                   // 等待提交超时
 	ReasonDuplicate                 // 重复提案（幂等返回缓存结果）
+	ReasonConfigBusy                // 已有未提交的成员变更，拒绝并发变更
+	ReasonNotMember                 // 候选人/目标节点不在当前成员配置中
 )
 
 func (r RejectReason) String() string {
@@ -65,6 +67,10 @@ func (r RejectReason) String() string {
 		return "Timeout"
 	case ReasonDuplicate:
 		return "Duplicate"
+	case ReasonConfigBusy:
+		return "ConfigBusy"
+	case ReasonNotMember:
+		return "NotMember"
 	}
 	return "Unknown"
 }
@@ -83,10 +89,49 @@ func (e *RejectError) Error() string {
 	return "raft: rejected (" + e.Reason.String() + "): " + e.Detail
 }
 
+// EntryType 日志条目类型：普通业务条目或成员变更条目。
+type EntryType int
+
+const (
+	EntryNormal     EntryType = iota
+	EntryNoop                 // leader 上任时的空条目：用于提交前任期的条目（含成员变更）
+	EntryAddLearner           // 将目标节点加入为 learner（非投票成员，不计入多数派）
+	EntryPromote              // 将已追平的 learner 提升为正式投票成员
+	EntryRemoveNode           // 将节点移出集群（投票成员或 learner）
+)
+
+func (t EntryType) String() string {
+	switch t {
+	case EntryNormal:
+		return "Normal"
+	case EntryNoop:
+		return "Noop"
+	case EntryAddLearner:
+		return "AddLearner"
+	case EntryPromote:
+		return "Promote"
+	case EntryRemoveNode:
+		return "RemoveNode"
+	}
+	return "Unknown"
+}
+
+// IsConfig 报告条目类型是否为成员变更。
+func (t EntryType) IsConfig() bool {
+	return t == EntryAddLearner || t == EntryPromote || t == EntryRemoveNode
+}
+
 // LogEntry 日志条目。ClientID+Seq 用于提案幂等去重。
+// Type 非 EntryNormal 时为成员变更条目：NodeID 为变更目标，
+// Voters/Learners 携带变更生效后的完整成员配置（而非增量），
+// 使任何节点应用该条目后都能重建完整配置（含初始引导成员）。
 type LogEntry struct {
 	Term     uint64
 	Index    uint64
+	Type     EntryType
+	NodeID   NodeID   // 成员变更目标节点（Type != EntryNormal 时有效）
+	Voters   []NodeID // 变更后的完整投票成员集（仅成员变更条目）
+	Learners []NodeID // 变更后的完整 learner 集（仅成员变更条目）
 	ClientID string
 	Seq      uint64
 	Op       []byte
@@ -150,6 +195,9 @@ type Message struct {
 	Success    bool
 	Reason     RejectReason
 	MatchIndex uint64
+	// CommitIndex 回显回复方当前已应用的提交位点，
+	// 用于 leader 判断被移除节点是否已亲知移除条目生效。
+	CommitIndex uint64
 
 	// InstallSnapshot
 	SnapshotIndex uint64
@@ -160,7 +208,8 @@ type Message struct {
 // Config 节点配置。
 type Config struct {
 	ID                 NodeID
-	Peers              []NodeID // 含自身的全部节点
+	Peers              []NodeID // 初始集群的全部投票成员（含自身）；仅用于全新集群的首次引导
+	Learner            bool     // 以 learner 身份启动（用于在线扩容加入的新节点），不参与选举与多数派
 	HeartbeatInterval  time.Duration
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration

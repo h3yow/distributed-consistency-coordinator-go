@@ -5,11 +5,13 @@ import (
 	"time"
 )
 
-// snapshotEnvelope 快照信封：状态机数据 + 提案去重状态，
-// 保证安装快照的节点与生成方在去重视图上一致。
+// snapshotEnvelope 快照信封：状态机数据 + 提案去重状态 + 成员配置，
+// 保证安装快照的节点与生成方在去重视图和成员配置上完全一致。
 type snapshotEnvelope struct {
-	SMData  []byte            `json:"sm"`
-	LastSeq map[string]uint64 `json:"seq"`
+	SMData   []byte            `json:"sm"`
+	LastSeq  map[string]uint64 `json:"seq"`
+	Members  []NodeID          `json:"members,omitempty"`
+	Learners []NodeID          `json:"learners,omitempty"`
 }
 
 // maybeSnapshotLocked 在日志超过阈值时，基于已应用（必已提交）状态生成快照。
@@ -29,7 +31,12 @@ func (n *Node) maybeSnapshotLocked() {
 		n.logf("snapshot failed: %v", err)
 		return
 	}
-	env, err := json.Marshal(snapshotEnvelope{SMData: smData, LastSeq: n.lastSeq})
+	env, err := json.Marshal(snapshotEnvelope{
+		SMData:   smData,
+		LastSeq:  n.lastSeq,
+		Members:  sortedKeysLocked(n.members),
+		Learners: sortedKeysLocked(n.learners),
+	})
 	if err != nil {
 		n.logf("snapshot encode failed: %v", err)
 		return
@@ -44,7 +51,7 @@ func (n *Node) maybeSnapshotLocked() {
 	n.logf("snapshot created boundary=%d/%d commitIndex=%d", snapIndex, snapTerm, n.commitIndex)
 }
 
-// restoreSnapshotLocked 用快照数据恢复状态机与去重状态（不触碰日志，由调用方维护）。
+// restoreSnapshotLocked 用快照数据恢复状态机、去重状态与成员配置（不触碰日志，由调用方维护）。
 func (n *Node) restoreSnapshotLocked(index uint64, data []byte) {
 	var env snapshotEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -59,6 +66,18 @@ func (n *Node) restoreSnapshotLocked(index uint64, data []byte) {
 		if n.lastSeq[k] < v {
 			n.lastSeq[k] = v
 		}
+	}
+	// 成员配置随快照整体替换（快照点处的已提交配置）；旧版本快照无此字段时保持现状。
+	if env.Members != nil || env.Learners != nil {
+		n.members = make(map[NodeID]bool, len(env.Members))
+		for _, id := range env.Members {
+			n.members[id] = true
+		}
+		n.learners = make(map[NodeID]bool, len(env.Learners))
+		for _, id := range env.Learners {
+			n.learners[id] = true
+		}
+		n.logf("membership restored from snapshot: members=%v learners=%v", env.Members, env.Learners)
 	}
 	if index > n.commitIndex {
 		n.commitIndex = index
@@ -99,6 +118,7 @@ func (n *Node) handleInstallSnapshotLocked(m *Message) {
 		// 已覆盖，幂等成功。
 		reply.Success = true
 		reply.MatchIndex = base
+		reply.CommitIndex = n.commitIndex
 		n.sendLocked(reply)
 		return
 	}
@@ -116,6 +136,7 @@ func (n *Node) handleInstallSnapshotLocked(m *Message) {
 
 	reply.Success = true
 	reply.MatchIndex = m.SnapshotIndex
+	reply.CommitIndex = n.commitIndex
 	n.sendLocked(reply)
 }
 
@@ -132,6 +153,7 @@ func (n *Node) handleInstallSnapshotReplyLocked(m *Message) {
 		n.matchIndex[m.From] = m.MatchIndex
 	}
 	n.nextIndex[m.From] = n.matchIndex[m.From] + 1
+	n.maybeDropRemovedLocked(m.From, m.CommitIndex)
 	n.advanceCommitLocked()
 }
 
